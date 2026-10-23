@@ -54,6 +54,10 @@ spec:
   groupRetirementWorkflow:
     workflowType: AuthorizeRetirement
     taskQueue: release-management
+  # Optional: complete application cleanup after every worker pod has stopped.
+  groupCleanupWorkflow:
+    workflowType: CleanupBuild
+    taskQueue: release-management
   rollout:
     strategy: AllAtOnce
   sunset:
@@ -185,12 +189,41 @@ remaining pinned workflow activity and its visibility grace period. After its
 saved `sunset.scaledownDelay` measured from Temporal's `DrainedSince`, the
 controller scales every member to zero. After the additional saved
 `sunset.deleteDelay`, it waits for Kubernetes to observe no remaining or
-terminating pods and starts cleanup. An application workflow's success time or a
-zero running-workflow count never substitutes for `Drained`.
+terminating pods before deleting the group. An application workflow's success time
+or a zero running-workflow count never substitutes for `Drained`.
 
-The controller records cleanup intent in the saved revision's metadata before
-removing the Temporal version. If cleanup is interrupted, later reconciles finish
-deleting members instead of recreating workers. The saved record is deleted only
+Optionally supply `groupCleanupWorkflow.workflowType` and `taskQueue` to finish
+application-owned cleanup before the controller deletes the group. This is a
+separate workflow from the pre-drain retirement check. It runs only after Temporal
+reports `Drained` with `DrainedSince`, the saved sunset delays have passed, and
+every member has reached zero replicas. The controller also reads each saved
+member's exact pod selector directly from Kubernetes and waits until no pod
+objects remain, including terminating pods. The controller needs the updated
+read-only pod-list RBAC permission before this hook can run.
+
+An unversioned management worker outside every grouped build implements cleanup.
+The controller starts `cleanup-<deploymentName>:<buildID>` with exactly two string
+arguments: the Temporal deployment name and build ID. It sets no execution or run
+deadline. Keep these arguments when continuing as new, complete only after all
+application resources for that exact build have been cleaned up, and retry
+temporary dependency failures within the workflow. A stopped manager, failed
+start, running workflow, or failed or canceled execution retains the Temporal
+version, member Deployment objects at zero replicas, and saved build. The
+controller observes the same workflow after an interrupted or uncertain start;
+it does not restart closed executions. It checks the latest run's saved type,
+queue, unversioned behavior, and original arguments before accepting success.
+Keep this workflow's history available until the saved build is deleted.
+
+Cleanup configuration belongs to the immutable saved build. Adding the hook to a
+new release does not add it to older saved builds. Grouped builds without this
+optional hook keep their existing deletion behavior; single-Deployment resources
+cannot set it. Whole-resource deletion remains a separate operation and does not
+run this hook.
+
+The controller records cleanup intent in the saved revision's metadata after any
+configured application cleanup succeeds and before removing the Temporal version.
+If cleanup is interrupted, later reconciles finish deleting members instead of
+recreating workers. The saved record is deleted only
 after every member Deployment object is gone. A build whose cleanup has already
 started completes cleanup before it can be created again.
 

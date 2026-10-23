@@ -91,6 +91,12 @@ rules:
       - create
       - patch
   - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - list
+  - apiGroups:
       - apps
     resources:
       - controllerrevisions
@@ -214,6 +220,12 @@ rules:
       - namespaces
     verbs:
       - get
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - list
   - apiGroups:
       - apps
     resources:

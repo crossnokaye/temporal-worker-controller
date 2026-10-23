@@ -53,6 +53,7 @@ type WorkerOptions struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.expectedTaskQueues) || size(self.expectedTaskQueues) == 0 || (has(self.additionalDeployments) && size(self.additionalDeployments) > 0)",message="expectedTaskQueues is only supported for grouped workers"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalDeployments) || size(self.additionalDeployments) == 0 || has(self.groupRetirementWorkflow)",message="grouped workers require groupRetirementWorkflow"
 // +kubebuilder:validation:XValidation:rule="!has(self.groupRetirementWorkflow) || (has(self.additionalDeployments) && size(self.additionalDeployments) > 0)",message="groupRetirementWorkflow is only supported for grouped workers"
+// +kubebuilder:validation:XValidation:rule="!has(self.groupCleanupWorkflow) || (has(self.additionalDeployments) && size(self.additionalDeployments) > 0)",message="groupCleanupWorkflow is only supported for grouped workers"
 type WorkerDeploymentSpec struct {
 
 	// Number of desired pods. When set, the controller manages replicas for all active
@@ -130,6 +131,14 @@ type WorkerDeploymentSpec struct {
 	// +optional
 	GroupRetirementWorkflow *GroupRetirementWorkflowConfig `json:"groupRetirementWorkflow,omitempty"`
 
+	// GroupCleanupWorkflow removes application resources after Temporal confirms
+	// drainage and every member pod has stopped. It receives deployment name and
+	// build ID as two string arguments on an unversioned queue outside the group.
+	// Success permits deleting the Temporal version, members, and saved build.
+	// Only supported when additionalDeployments is set.
+	// +optional
+	GroupCleanupWorkflow *GroupCleanupWorkflowConfig `json:"groupCleanupWorkflow,omitempty"`
+
 	// DrainingDeployment overrides settings for single-Deployment versions only.
 	// Grouped builds retain their independent saved member counts while draining.
 	// It changes the Kubernetes Deployments of
@@ -159,6 +168,18 @@ type WorkerDeploymentSpec struct {
 }
 
 type (
+	// GroupCleanupWorkflowConfig identifies the application's cleanup workflow.
+	// The workflow must complete its cleanup before returning success and retry
+	// temporary dependency failures within the workflow.
+	GroupCleanupWorkflowConfig struct {
+		// WorkflowType is registered on the unversioned management worker.
+		// +kubebuilder:validation:MinLength=1
+		WorkflowType string `json:"workflowType"`
+		// TaskQueue is polled by unversioned workers outside every grouped build.
+		// +kubebuilder:validation:MinLength=1
+		TaskQueue string `json:"taskQueue"`
+	}
+
 	// GroupRetirementWorkflowConfig identifies the application's retirement check.
 	// The workflow must finish only after the application permanently stops new
 	// admission and no caller relies on the server selecting its ramping version.

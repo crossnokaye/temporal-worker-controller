@@ -150,6 +150,9 @@ func validateSavedGroup(ctx context.Context, spec *v1alpha1.WorkerDeploymentSpec
 	if spec.GroupRetirementWorkflow == nil || spec.GroupRetirementWorkflow.WorkflowType == "" || spec.GroupRetirementWorkflow.TaskQueue == "" {
 		return fmt.Errorf("group retirement workflow type and task queue are required")
 	}
+	if config := spec.GroupCleanupWorkflow; config != nil && (config.WorkflowType == "" || config.TaskQueue == "") {
+		return fmt.Errorf("group cleanup workflow type and task queue are required when configured")
+	}
 	members := map[string]bool{PrimaryMember: true}
 	for _, member := range spec.AdditionalDeployments {
 		if members[member.Name] || len(validation.IsDNS1123Label(member.Name)) > 0 || member.Replicas < 1 {

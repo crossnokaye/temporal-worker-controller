@@ -63,6 +63,8 @@ const (
 // WorkerDeploymentReconciler reconciles a WorkerDeployment object
 type WorkerDeploymentReconciler struct {
 	client.Client
+	// apiReader reads pods directly so an old empty cache cannot approve cleanup.
+	apiReader          client.Reader
 	Scheme             *runtime.Scheme
 	TemporalClientPool *clientpool.ClientPool
 	Recorder           record.EventRecorder
@@ -111,6 +113,7 @@ type WorkerDeploymentReconciler struct {
 // +kubebuilder:rbac:groups=temporal.io,resources=workerdeployments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=temporal.io,resources=workerdeployments/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=list
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get;list;watch;create;patch;delete
@@ -957,6 +960,7 @@ func (r *WorkerDeploymentReconciler) recordWarningAndSetBlocked(
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkerDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.apiReader = mgr.GetAPIReader()
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &appsv1.Deployment{}, deployOwnerKey, func(rawObj client.Object) []string {
 		// grab the job object, extract the owner...
 		deploy := rawObj.(*appsv1.Deployment)

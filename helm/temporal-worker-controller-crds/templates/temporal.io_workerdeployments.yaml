@@ -7807,6 +7807,18 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              groupCleanupWorkflow:
+                properties:
+                  taskQueue:
+                    minLength: 1
+                    type: string
+                  workflowType:
+                    minLength: 1
+                    type: string
+                required:
+                - taskQueue
+                - workflowType
+                type: object
               groupRetirementWorkflow:
                 properties:
                   taskQueue:
@@ -11822,6 +11834,9 @@ spec:
                 == 0 || has(self.groupRetirementWorkflow)'
             - message: groupRetirementWorkflow is only supported for grouped workers
               rule: '!has(self.groupRetirementWorkflow) || (has(self.additionalDeployments)
+                && size(self.additionalDeployments) > 0)'
+            - message: groupCleanupWorkflow is only supported for grouped workers
+              rule: '!has(self.groupCleanupWorkflow) || (has(self.additionalDeployments)
                 && size(self.additionalDeployments) > 0)'
           status:
             properties:

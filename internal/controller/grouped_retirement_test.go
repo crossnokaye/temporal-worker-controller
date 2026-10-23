@@ -38,16 +38,20 @@ import (
 type (
 	retirementClient struct {
 		sdkclient.Client
-		info    map[string]*workflowpb.WorkflowExecutionInfo
-		history *retirementHistoryClient
-		started []sdkclient.StartWorkflowOptions
-		args    [][]any
+		info           map[string]*workflowpb.WorkflowExecutionInfo
+		history        *retirementHistoryClient
+		started        []sdkclient.StartWorkflowOptions
+		args           [][]any
+		startErr       error
+		describeErrors map[string]error
+		workflowTypes  []any
 	}
 	retirementHistoryClient struct {
 		workflowservice.WorkflowServiceClient
 		input      *commonpb.Payloads
 		requests   []*workflowservice.GetWorkflowExecutionHistoryRequest
 		err        error
+		errors     map[string]error
 		batched    bool
 		inputs     map[string]*commonpb.Payloads
 		deployment *workflowservice.DescribeWorkerDeploymentResponse
@@ -61,6 +65,9 @@ type (
 )
 
 func (c *retirementClient) DescribeWorkflowExecution(_ context.Context, id, _ string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
+	if err := c.describeErrors[id]; err != nil {
+		return nil, err
+	}
 	info := c.info[id]
 	if info == nil {
 		return nil, &serviceerror.NotFound{}
@@ -68,21 +75,26 @@ func (c *retirementClient) DescribeWorkflowExecution(_ context.Context, id, _ st
 	return &workflowservice.DescribeWorkflowExecutionResponse{WorkflowExecutionInfo: info}, nil
 }
 func (c *retirementClient) WorkflowService() workflowservice.WorkflowServiceClient { return c.history }
-func (c *retirementClient) ExecuteWorkflow(_ context.Context, opts sdkclient.StartWorkflowOptions, _ any, args ...any) (sdkclient.WorkflowRun, error) {
+func (c *retirementClient) ExecuteWorkflow(_ context.Context, opts sdkclient.StartWorkflowOptions, workflowType any, args ...any) (sdkclient.WorkflowRun, error) {
 	c.started = append(c.started, opts)
 	c.args = append(c.args, args)
-	return nil, nil
+	c.workflowTypes = append(c.workflowTypes, workflowType)
+	return nil, c.startErr
 }
 func (c *retirementHistoryClient) GetWorkflowExecutionHistory(_ context.Context, req *workflowservice.GetWorkflowExecutionHistoryRequest, _ ...grpc.CallOption) (*workflowservice.GetWorkflowExecutionHistoryResponse, error) {
 	c.requests = append(c.requests, req)
+	historyErr := c.err
+	if c.errors != nil {
+		historyErr = c.errors[req.Execution.WorkflowId]
+	}
 	input := c.input
 	if c.inputs != nil {
 		input = c.inputs[req.Execution.WorkflowId]
 	}
 	if c.batched {
-		return &workflowservice.GetWorkflowExecutionHistoryResponse{History: &historypb.History{Events: []*historypb.HistoryEvent{{EventId: 1, Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{Input: input}}}, {EventId: 2, EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED}}}}, c.err
+		return &workflowservice.GetWorkflowExecutionHistoryResponse{History: &historypb.History{Events: []*historypb.HistoryEvent{{EventId: 1, Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{Input: input}}}, {EventId: 2, EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED}}}}, historyErr
 	}
-	return &workflowservice.GetWorkflowExecutionHistoryResponse{History: &historypb.History{Events: []*historypb.HistoryEvent{{EventId: 1, Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{Input: input}}}}}}, c.err
+	return &workflowservice.GetWorkflowExecutionHistoryResponse{History: &historypb.History{Events: []*historypb.HistoryEvent{{EventId: 1, Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{Input: input}}}}}}, historyErr
 }
 func (h *retirementRoutingHandle) Describe(context.Context, sdkclient.WorkerDeploymentDescribeOptions) (sdkclient.WorkerDeploymentDescribeResponse, error) {
 	return h.description, nil
@@ -130,7 +142,7 @@ func TestGroupedRetirementInitializesServerDrainageWithoutStoppingMembers(t *tes
 		t.Run(string(state), func(t *testing.T) {
 			p, h := retirementPlan(t, state)
 			c := approvedRetirements(t, p, newStubTemporalClientWithHandle(h))
-			require.NoError(t, planGroupRetirements(context.Background(), c, p))
+			require.NoError(t, testPlanGroupRetirements(t, c, p))
 			require.Len(t, h.calls, 2)
 			assert.Equal(t, "build-b", h.calls[0].BuildID)
 			assert.Zero(t, h.calls[0].Percentage)
@@ -167,7 +179,7 @@ func TestGroupedRetirementRespectsReleaseRoutingAndRecoversInterruptedPair(t *te
 				p.UpdateVersionConfig = &planner.VersionConfig{BuildID: "build-c", SetCurrent: true}
 			}
 			c := approvedRetirements(t, p, newStubTemporalClientWithHandle(h))
-			err := planGroupRetirements(context.Background(), c, p)
+			err := testPlanGroupRetirements(t, c, p)
 			assert.Equal(t, test.failAt != 0, err != nil)
 			assert.Len(t, h.calls, test.want)
 			assert.Empty(t, p.ScaleDeployments)
@@ -197,7 +209,7 @@ func TestGroupedRetirementUsesCurrentRoutingAuthority(t *testing.T) {
 			require.NoError(t, err)
 			p.allowGroupedDrainage = generated.allowGroupedDrainage
 			c := approvedRetirements(t, p, newStubTemporalClientWithHandle(h))
-			require.NoError(t, planGroupRetirements(context.Background(), c, p))
+			require.NoError(t, testPlanGroupRetirements(t, c, p))
 			assert.Len(t, h.calls, test.writes)
 			assert.Empty(t, p.ScaleDeployments)
 		})
@@ -211,7 +223,7 @@ func TestGroupedRetirementApprovalDoesNotReplaceTemporalDrainage(t *testing.T) {
 			drained := time.Now().Add(-time.Hour)
 			p.groupRetirements[0].version.DrainedSince = &drained
 			c := approvedRetirements(t, p, newStubTemporalClientWithHandle(h))
-			require.NoError(t, planGroupRetirements(context.Background(), c, p))
+			require.NoError(t, testPlanGroupRetirements(t, c, p))
 			assert.Equal(t, state == v1alpha1.VersionStatusDrained, len(p.ScaleDeployments) == 2)
 			assert.Empty(t, h.calls)
 		})
@@ -242,7 +254,7 @@ func TestGroupedRetirementStartsWithoutDeadlinesAndBindsLatestRunInput(t *testin
 	assert.ErrorContains(t, err, "does not match")
 	c.history.err = errors.New("unavailable")
 	_, err = completedRetirement(context.Background(), c, p, p.groupRetirements[0])
-	assert.ErrorContains(t, err, "read group retirement input")
+	assert.ErrorContains(t, err, "read group workflow input")
 }
 func TestGroupedRetirementRejectsVersionedExecutionAndReselection(t *testing.T) {
 	p, _ := retirementPlan(t, v1alpha1.VersionStatusInactive)
@@ -274,7 +286,7 @@ func TestGroupedDrainedDelayDoesNotRestoreAlreadyStoppedMembers(t *testing.T) {
 		p.ScaleDeployments[k8s.NewObjectRef(member)] = 3
 	}
 	c := approvedRetirements(t, p, newStubTemporalClientWithHandle(h))
-	require.NoError(t, planGroupRetirements(context.Background(), c, p))
+	require.NoError(t, testPlanGroupRetirements(t, c, p))
 	assert.Empty(t, p.ScaleDeployments)
 }
 func TestGroupedRetirementIncompleteOrFailedCheckRetainsMembers(t *testing.T) {
@@ -285,7 +297,7 @@ func TestGroupedRetirementIncompleteOrFailedCheckRetainsMembers(t *testing.T) {
 			for _, info := range c.info {
 				info.Status = state
 			}
-			require.NoError(t, planGroupRetirements(context.Background(), c, p))
+			require.NoError(t, testPlanGroupRetirements(t, c, p))
 			assert.Empty(t, p.ScaleDeployments)
 			assert.Empty(t, h.calls)
 		})
@@ -320,7 +332,7 @@ func TestGroupedRetirementFailureDoesNotBlockOtherObsoleteGroups(t *testing.T) {
 	p.groupRetirements = append(p.groupRetirements, second.groupRetirements[0])
 	c := approvedRetirements(t, p, newStubTemporalClientWithHandle(h))
 	c.info[retirementWorkflowID(p.WorkerDeploymentName, "build-b")].TaskQueue = "wrong-management-queue"
-	assert.Error(t, planGroupRetirements(context.Background(), c, p))
+	assert.Error(t, testPlanGroupRetirements(t, c, p))
 	assert.Len(t, p.ScaleDeployments, 2)
 	for ref := range p.ScaleDeployments {
 		assert.Contains(t, ref.Name, "-other")
@@ -381,4 +393,10 @@ func TestReconcileGroupedRetirementFailureKeepsHealthyCurrentReleaseReady(t *tes
 		require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(oldMember), &retained))
 		assert.Positive(t, *retained.Spec.Replicas)
 	}
+}
+
+func testPlanGroupRetirements(t *testing.T, c sdkclient.Client, p *plan) error {
+	t.Helper()
+	r, _ := newTestReconciler(nil)
+	return r.planGroupRetirements(context.Background(), c, p)
 }

@@ -349,6 +349,21 @@ var _ = Describe("WorkerDeployment CRD CEL validation", func() {
 			valid  bool
 		}{
 			{"valid-group", func(*WorkerDeployment) {}, true},
+			{"valid-cleanup", func(w *WorkerDeployment) {
+				w.Spec.GroupCleanupWorkflow = &GroupCleanupWorkflowConfig{WorkflowType: "CleanupBuild", TaskQueue: "management"}
+			}, true},
+			{"empty-cleanup-type", func(w *WorkerDeployment) {
+				w.Spec.GroupCleanupWorkflow = &GroupCleanupWorkflowConfig{TaskQueue: "management"}
+			}, false},
+			{"empty-cleanup-queue", func(w *WorkerDeployment) {
+				w.Spec.GroupCleanupWorkflow = &GroupCleanupWorkflowConfig{WorkflowType: "CleanupBuild"}
+			}, false},
+			{"single-cleanup", func(w *WorkerDeployment) {
+				w.Spec.GroupCleanupWorkflow = &GroupCleanupWorkflowConfig{WorkflowType: "CleanupBuild", TaskQueue: "management"}
+				w.Spec.GroupRetirementWorkflow = nil
+				w.Spec.ExpectedTaskQueues = nil
+				w.Spec.AdditionalDeployments = nil
+			}, false},
 			{"missing-retirement", func(w *WorkerDeployment) { w.Spec.GroupRetirementWorkflow = nil }, false},
 			{"empty-retirement-type", func(w *WorkerDeployment) { w.Spec.GroupRetirementWorkflow.WorkflowType = "" }, false},
 			{"empty-retirement-queue", func(w *WorkerDeployment) { w.Spec.GroupRetirementWorkflow.TaskQueue = "" }, false},

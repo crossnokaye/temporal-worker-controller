@@ -4,6 +4,8 @@
 // new work can enter a build and no caller relies on implicit ramp selection.
 // The controller can then initialize server-owned drainage with a zero-percent
 // ramp. Only Temporal drainage permits pod shutdown; the application check does not.
+// After pods stop, an optional saved cleanup workflow must complete before any
+// Temporal version, Deployment object, or saved build record can be deleted.
 package controller
 
 import (
@@ -24,6 +26,9 @@ import (
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type (
@@ -67,10 +72,10 @@ func checkTargetGroupRetirement(ctx context.Context, c sdkclient.Client, w *v1al
 // planGroupRetirements waits for the saved application approval and closed
 // readiness workflows. It starts server-owned drainage for inactive builds, then
 // retains every member until Temporal reports the build drained.
-func planGroupRetirements(ctx context.Context, c sdkclient.Client, p *plan) error {
+func (r *WorkerDeploymentReconciler) planGroupRetirements(ctx context.Context, c sdkclient.Client, p *plan) error {
 	var failures []error
 	for _, group := range p.groupRetirements {
-		if err := planGroupRetirement(ctx, c, p, group); err != nil {
+		if err := r.planGroupRetirement(ctx, c, p, group); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -79,8 +84,9 @@ func planGroupRetirements(ctx context.Context, c sdkclient.Client, p *plan) erro
 
 // planGroupRetirement keeps one obsolete group's saved pod counts until its
 // application approval, readiness workflow closure, and Temporal drainage permit
-// retirement. A failed check changes no worker plan for this group.
-func planGroupRetirement(ctx context.Context, c sdkclient.Client, p *plan, group groupRetirement) error {
+// retirement. Once workers stop, an optional application cleanup must succeed
+// before any member or saved record is nominated for deletion.
+func (r *WorkerDeploymentReconciler) planGroupRetirement(ctx context.Context, c sdkclient.Client, p *plan, group groupRetirement) error {
 	approved, err := completedRetirement(ctx, c, p, group)
 	if err != nil {
 		return err
@@ -123,16 +129,55 @@ func planGroupRetirement(ctx context.Context, c sdkclient.Client, p *plan, group
 				delete(p.ScaleDeployments, ref)
 			}
 		}
-		if deleting {
-			p.DeleteDeployments = append(p.DeleteDeployments, actual)
-		} else if actual.Spec.Replicas == nil || *actual.Spec.Replicas != 0 {
+		if actual.Spec.Replicas == nil || *actual.Spec.Replicas != 0 {
 			p.ScaleDeployments[k8s.NewObjectRef(actual)] = 0
 		}
 	}
-	if deleting {
-		p.MarkRevisionsForDeletion = append(p.MarkRevisionsForDeletion, group.saved.Object)
+	if !deleting {
+		return nil
 	}
+	if config := group.saved.Spec.GroupCleanupWorkflow; config != nil {
+		stopped, err := r.groupPodsGone(ctx, group)
+		if err != nil || !stopped {
+			return err
+		}
+		completed, err := completedGroupWorkflow(ctx, c, p, group.buildID,
+			cleanupWorkflowID(p.WorkerDeploymentName, group.buildID), config.WorkflowType, config.TaskQueue)
+		if err != nil || !completed {
+			return err
+		}
+	}
+	for _, actual := range group.actual {
+		p.DeleteDeployments = append(p.DeleteDeployments, actual)
+	}
+	p.MarkRevisionsForDeletion = append(p.MarkRevisionsForDeletion, group.saved.Object)
 	return nil
+}
+
+// groupPodsGone reads each saved member's exact pod selector directly from
+// Kubernetes. Any remaining pod, including one still terminating, keeps the
+// application cleanup waiting after the Deployment reports zero replicas.
+func (r *WorkerDeploymentReconciler) groupPodsGone(ctx context.Context, group groupRetirement) (bool, error) {
+	for _, member := range group.desired {
+		selector, err := metav1.LabelSelectorAsSelector(member.Spec.Selector)
+		if err != nil {
+			return false, fmt.Errorf("read grouped member %q pod selector: %w", member.Name, err)
+		}
+		var pods corev1.PodList
+		if err := r.apiReader.List(ctx, &pods, client.InNamespace(member.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+			return false, fmt.Errorf("confirm grouped member %q pods stopped: %w", member.Name, err)
+		}
+		if len(pods.Items) != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// cleanupWorkflowID assigns application cleanup its own identity for one saved
+// build. Reconciliation observes this execution again after an interrupted start.
+func cleanupWorkflowID(deploymentName, buildID string) string {
+	return fmt.Sprintf("cleanup-%s:%s", deploymentName, buildID)
 }
 
 // initializeGroupDrainage briefly assigns an approved obsolete build a zero
@@ -186,29 +231,37 @@ func initializeGroupDrainage(ctx context.Context, c sdkclient.Client, p *plan, b
 // latest run thereafter. Success authorizes the routing maintenance operation;
 // Temporal must still prove that every pinned execution has finished.
 func completedRetirement(ctx context.Context, c sdkclient.Client, p *plan, group groupRetirement) (bool, error) {
-	deploymentName := p.WorkerDeploymentName
 	config := group.saved.Spec.GroupRetirementWorkflow
-	id := retirementWorkflowID(deploymentName, group.buildID)
+	return completedGroupWorkflow(ctx, c, p, group.buildID,
+		retirementWorkflowID(p.WorkerDeploymentName, group.buildID), config.WorkflowType, config.TaskQueue)
+}
+
+// completedGroupWorkflow starts one saved application workflow and accepts only
+// a successful execution with the exact type, queue, and original two arguments.
+// Missing or running workflows keep deletion waiting; failed requests return an
+// error so reconciliation retains the saved build and retries observation later.
+func completedGroupWorkflow(ctx context.Context, c sdkclient.Client, p *plan, buildID, id, workflowType, taskQueue string) (bool, error) {
+	deploymentName := p.WorkerDeploymentName
 	description, err := c.DescribeWorkflowExecution(ctx, id, "")
 	var missing *serviceerror.NotFound
 	if errors.As(err, &missing) {
 		_, err = c.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
-			ID: id, TaskQueue: config.TaskQueue,
+			ID: id, TaskQueue: taskQueue,
 			WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL,
-		}, config.WorkflowType, deploymentName, group.buildID)
+		}, workflowType, deploymentName, buildID)
 		var exists *serviceerror.WorkflowExecutionAlreadyStarted
 		if err != nil && !errors.As(err, &exists) {
-			return false, fmt.Errorf("start group retirement workflow %q: %w", id, err)
+			return false, fmt.Errorf("start group workflow %q: %w", id, err)
 		}
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("describe group retirement workflow %q: %w", id, err)
+		return false, fmt.Errorf("describe group workflow %q: %w", id, err)
 	}
 	info := description.GetWorkflowExecutionInfo()
-	if info.GetExecution().GetWorkflowId() != id || info.GetExecution().GetRunId() == "" || info.GetType().GetName() != config.WorkflowType || info.GetTaskQueue() != config.TaskQueue || !unversionedRetirement(info.GetVersioningInfo()) {
-		return false, fmt.Errorf("group retirement workflow %q must match its saved type and unversioned management queue", id)
+	if info.GetExecution().GetWorkflowId() != id || info.GetExecution().GetRunId() == "" || info.GetType().GetName() != workflowType || info.GetTaskQueue() != taskQueue || !unversionedGroupWorkflow(info.GetVersioningInfo()) {
+		return false, fmt.Errorf("group workflow %q must match its saved type and unversioned management queue", id)
 	}
 	if info.GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED || info.GetCloseTime() == nil || info.GetCloseTime().CheckValid() != nil {
 		return false, nil
@@ -223,29 +276,29 @@ func completedRetirement(ctx context.Context, c sdkclient.Client, p *plan, group
 		HistoryEventFilterType: enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT,
 	})
 	if err != nil {
-		return false, fmt.Errorf("read group retirement input %q: %w", id, err)
+		return false, fmt.Errorf("read group workflow input %q: %w", id, err)
 	}
 	events := history.GetHistory().GetEvents()
 	if len(events) == 0 || events[0].GetEventId() != 1 || events[0].GetWorkflowExecutionStartedEventAttributes() == nil {
-		return false, fmt.Errorf("group retirement workflow %q has no initial input event", id)
+		return false, fmt.Errorf("group workflow %q has no initial input event", id)
 	}
 	input := events[0].GetWorkflowExecutionStartedEventAttributes().GetInput()
 	if len(input.GetPayloads()) != 2 {
-		return false, fmt.Errorf("group retirement workflow %q requires exactly two string arguments", id)
+		return false, fmt.Errorf("group workflow %q requires exactly two string arguments", id)
 	}
 	var suppliedDeployment, suppliedBuild string
 	if err := converter.GetDefaultDataConverter().FromPayloads(input, &suppliedDeployment, &suppliedBuild); err != nil {
-		return false, fmt.Errorf("decode group retirement input %q: %w", id, err)
+		return false, fmt.Errorf("decode group workflow input %q: %w", id, err)
 	}
-	if suppliedDeployment != deploymentName || suppliedBuild != group.buildID {
-		return false, fmt.Errorf("group retirement workflow %q input does not match its saved deployment and build", id)
+	if suppliedDeployment != deploymentName || suppliedBuild != buildID {
+		return false, fmt.Errorf("group workflow %q input does not match its saved deployment and build", id)
 	}
 	return true, nil
 }
 
-// unversionedRetirement rejects effective deployment assignments as well as
-// overrides, so a worker in the retiring group cannot certify its own shutdown.
-func unversionedRetirement(info *workflowpb.WorkflowExecutionVersioningInfo) bool {
+// unversionedGroupWorkflow rejects effective deployment assignments as well as
+// overrides, so a grouped worker cannot approve its own retirement or cleanup.
+func unversionedGroupWorkflow(info *workflowpb.WorkflowExecutionVersioningInfo) bool {
 	//lint:ignore SA1019 Older servers expose deployment assignments in these fields.
 	return info.GetBehavior() == enumspb.VERSIONING_BEHAVIOR_UNSPECIFIED && info.GetVersioningOverride() == nil && info.GetDeploymentVersion() == nil && info.GetVersionTransition() == nil && info.GetDeployment() == nil && info.GetVersion() == "" && info.GetDeploymentTransition() == nil
 }

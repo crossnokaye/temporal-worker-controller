@@ -978,12 +978,13 @@ func (r *WorkerDeploymentReconciler) executePlan(
 	}
 
 	// Old readiness workflows must close before their group can retire. Failed
-	// cancellation or retirement checks keep that group alive and are retried by
-	// normal reconciliation; they do not make the new target unavailable.
-	retirementErr := errors.Join(cancelSupersededGates(ctx, temporalClient, p), planGroupRetirements(ctx, temporalClient, p))
+	// cancellation or retirement checks keep its workers running. Failed cleanup
+	// checks retain the stopped group's resources. Normal reconciliation retries
+	// these checks without making the new target unavailable.
+	retirementErr := errors.Join(cancelSupersededGates(ctx, temporalClient, p), r.planGroupRetirements(ctx, temporalClient, p))
 	if retirementErr != nil {
 		r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonGroupRetirementFailed,
-			"Obsolete grouped workers remain running while retirement is retried: %v", retirementErr)
+			"Obsolete grouped build resources are retained while retirement or cleanup is retried: %v", retirementErr)
 	}
 
 	// Save the cleanup decision before deleting the Temporal version. If this

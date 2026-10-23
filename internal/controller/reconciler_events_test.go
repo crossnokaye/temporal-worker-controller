@@ -88,6 +88,7 @@ func newTestReconcilerWithInterceptors(objs []client.Object, funcs interceptor.F
 
 	r := &WorkerDeploymentReconciler{
 		Client:              fakeClient,
+		apiReader:           fakeClient,
 		Scheme:              scheme,
 		TemporalClientPool:  clientpool.New(nil, fakeClient, nil),
 		Recorder:            recorder,
